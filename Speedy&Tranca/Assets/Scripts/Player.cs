@@ -6,6 +6,7 @@ using UnityEngine.InputSystem;
 
 public class Player : MonoBehaviour
 {
+    public Deck deck;
     // Attributes regarding the player
     // For game conditions
     private int score = 0;
@@ -39,10 +40,7 @@ public class Player : MonoBehaviour
     {
         for (int i = 0; i < 11; i++)
         {
-            // Preferred — instantiate a Card prefab
-            GameObject cardObject = Instantiate(cardPrefab);
-            Card card = cardObject.GetComponent<Card>();
-            hand.Add(card);
+            hand.Add(deck.Deal());
         }
         numCards = hand.Count;
     }
