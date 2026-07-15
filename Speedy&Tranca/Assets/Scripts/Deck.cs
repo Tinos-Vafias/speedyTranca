@@ -8,10 +8,14 @@ public class Deck : MonoBehaviour
     //Attributes
     public List<Card> deck;
     public GameObject cardPrefab;
+    public GameManager gameManager;
     
     
-    // Start is called once before the first execution of Update after the MonoBehaviour is created
-    void Start()
+    // Awake runs before any Start() in the scene, guaranteeing the deck is
+    // fully built before GameManager.Start() tries to deal from it. Using
+    // Start() here was a latent bug - it happened to look fine only because
+    // undealt cards used to spawn visible regardless of whether dealing worked.
+    void Awake()
     {
         BuildDeck();
         Shuffle();
@@ -24,17 +28,43 @@ public class Deck : MonoBehaviour
         
     }
 
+    // Clicking the deck draws a card. No drag involved here since there's
+    // nothing individual to drag - it's a single face-down stack.
+    void OnMouseDown()
+    {
+        gameManager.DrawFromDeck();
+    }
+
     private void BuildDeck()
     {
-        foreach (Card.Suit suit in System.Enum.GetValues(typeof(Card.Suit)))
+        // Tranca uses two 52-card decks plus jokers (108 cards total: 2x52 + 4 jokers)
+        for (int d = 0; d < 2; d++)
         {
-            foreach (Card.Rank rank in System.Enum.GetValues(typeof(Card.Rank)))
+            foreach (Card.Suit suit in System.Enum.GetValues(typeof(Card.Suit)))
             {
-                GameObject cardObject = Instantiate(cardPrefab);
+                if (suit == Card.Suit.None) continue; // reserved for jokers, not a real suit
+
+                foreach (Card.Rank rank in System.Enum.GetValues(typeof(Card.Rank)))
+                {
+                    if (rank == Card.Rank.Joker) continue; // added separately below
+
+                    GameObject cardObject = Instantiate(cardPrefab, transform.position, Quaternion.identity, transform);
+                    Card card = cardObject.GetComponent<Card>();
+                    card.SetCard(suit, rank);
+                    card.gameObject.SetActive(false); // hidden until dealt - stays face-down/invisible in the deck
+                    deck.Add(card);
+                }
+            }
+
+            // 2 jokers per deck = 4 total
+            for (int j = 0; j < 2; j++)
+            {
+                GameObject cardObject = Instantiate(cardPrefab, transform.position, Quaternion.identity, transform);
                 Card card = cardObject.GetComponent<Card>();
-                card.SetCard(suit, rank);
+                card.SetCard(Card.Suit.None, Card.Rank.Joker);
+                card.gameObject.SetActive(false);
                 deck.Add(card);
-            } 
+            }
         }
     }
 
@@ -57,5 +87,29 @@ public class Deck : MonoBehaviour
         }
         Debug.Log("Empty deck!");
         return null;
+    }
+
+    // Refills the draw deck from a released morto pile (used when the deck runs dry)
+    // and reshuffles so the refill isn't in a known order.
+    public void RefillFrom(List<Card> cards)
+    {
+        foreach (var c in cards)
+            c.gameObject.SetActive(false);
+        deck.AddRange(cards);
+        Shuffle();
+    }
+
+    // Deals an 11-card morto (reserve pile) and hides the cards until picked up.
+    public List<Card> DealMorto()
+    {
+        List<Card> morto = new List<Card>();
+        for (int i = 0; i < 11; i++)
+        {
+            Card c = Deal();
+            if (c == null) break;
+            c.gameObject.SetActive(false);
+            morto.Add(c);
+        }
+        return morto;
     }
 }
