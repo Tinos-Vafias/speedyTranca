@@ -4,8 +4,9 @@ using System.Linq;
 using UnityEngine.UIElements;
 using UnityEngine.XR;
 using UnityEngine.InputSystem;
+using Unity.Netcode;
 
-public class Player : MonoBehaviour
+public class Player : NetworkBehaviour
 {
     public Deck deck;
     public GameManager gameManager;
@@ -13,19 +14,45 @@ public class Player : MonoBehaviour
     // For game conditions
     private int score = 0;
     private bool hasWon = false;
-    
+
     // For cards
     public GameObject cardPrefab;
     private List<Card> hand = new List<Card>();
     private int numCards;
-    public Transform handContainer;
-    
-    public bool IsMyTurn { get; private set; }
+
+    // handContainer/meldContainer/redThreeContainer/stagingZoneAnchor are now
+    // computed properties (below), not cached fields - each one reads IsOwner
+    // fresh, every time it's used. Wire the SAME four pairs of anchors on BOTH
+    // the Player One and Player Two GameObjects - whichever Player object
+    // belongs to the local client uses the "local" anchor (bottom half of the
+    // screen), the other one uses the "opponent" anchor, regardless of whether
+    // that's Player One or Player Two underneath.
+    [Header("Local Player Anchors (bottom half)")]
+    public Transform localHandAnchor;
+    public Transform localMeldAnchor;
+    public Transform localRedThreeAnchor;
+    public Transform localStagingAnchor;
+
+    [Header("Opponent Anchors (top half)")]
+    public Transform opponentHandAnchor;
+    public Transform opponentMeldAnchor;
+    public Transform opponentRedThreeAnchor;
+    public Transform opponentStagingAnchor;
+
+    // IsOwner is always live/current - computing these on every access means
+    // there's no cached value that can go stale, and no dependency on
+    // OnGainedOwnership/OnNetworkSpawn firing in any particular order.
+    private Transform HandContainer => IsOwner ? localHandAnchor : opponentHandAnchor;
+    private Transform MeldContainer => IsOwner ? localMeldAnchor : opponentMeldAnchor;
+    private Transform RedThreeContainer => IsOwner ? localRedThreeAnchor : opponentRedThreeAnchor;
+    private Transform StagingZoneAnchor => IsOwner ? localStagingAnchor : opponentStagingAnchor;
+
+    // Whose turn it is is decided by the server (via GameManager); this just
+    // mirrors that decision so every client can read IsMyTurn correctly.
+    private NetworkVariable<bool> netIsMyTurn = new NetworkVariable<bool>(false);
+    public bool IsMyTurn => netIsMyTurn.Value;
 
     // --- Melds / table state ---
-    public Transform meldContainer;
-    public Transform redThreeContainer;
-    public Transform stagingZoneAnchor; // single staging area for building a brand-new meld
     private List<Meld> tableMelds = new List<Meld>();
     private List<Card> playedRedThrees = new List<Card>();
     private List<Card> stagingMeld = new List<Card>();
@@ -46,27 +73,43 @@ public class Player : MonoBehaviour
     public float rowWidthLimit = 12f;            // wrap to a new row past this width
     public float rowSpacingY = 1.0f;
 
-    // Start is called once before the first execution of Update after the MonoBehaviour is created
     void Start()
     {
         numCards = hand.Count;
     }
 
-    // Update is called once per frame
-    void Update()
-    {
-
-    }
-
     public void generateHand()
     {
+        if (!IsServer) return; // dealing is server-only
+
         for (int i = 0; i < 11; i++)
         {
             Card dealt = deck.Deal();
-            dealt.owner = this;          // NEW: so the card can notify us
+            dealt.owner = this;
             hand.Add(dealt);
+            dealt.SetVisible(true);
         }
         numCards = hand.Count;
+        DisplayHand();
+
+        // Mirror the deal to every other client.
+        var refs = hand.Select(c => (NetworkObjectReference)c.NetworkObject).ToArray();
+        MirrorInitialHandClientRpc(refs);
+    }
+
+    [ClientRpc]
+    private void MirrorInitialHandClientRpc(NetworkObjectReference[] cardRefs)
+    {
+        if (IsServer) return;
+        foreach (var r in cardRefs)
+        {
+            if (r.TryGet(out NetworkObject obj))
+            {
+                Card c = obj.GetComponent<Card>();
+                c.owner = this;
+                hand.Add(c);
+            }
+        }
         DisplayHand();
     }
 
@@ -78,8 +121,12 @@ public class Player : MonoBehaviour
         int count = hand.Count;
         float fanAngle = 30f;
         float radius = 15f;
-        // Push the arc center further down so cards fan upward from bottom center
-        Vector3 arcCenter = handContainer.position + new Vector3(0, -radius + 2f, 0);
+
+        Debug.Log($"[Player:{gameObject.name}] DisplayHand - IsOwner={IsOwner}, IsServer={IsServer}, " +
+            $"OwnerClientId={OwnerClientId}, LocalClientId={NetworkManager.Singleton.LocalClientId}, " +
+            $"HandContainer={(HandContainer == null ? "NULL" : HandContainer.name)}, cardCount={count}");
+
+        Vector3 arcCenter = HandContainer.position + new Vector3(0, -radius + 2f, 0);
 
         for (int i = 0; i < count; i++)
         {
@@ -87,7 +134,7 @@ public class Player : MonoBehaviour
             card.gameObject.SetActive(true);
 
             if (card.IsDragging) continue;
-            
+
             float t = count > 1 ? i / (float)(count - 1) : 0.5f;
             float angle = Mathf.Lerp(fanAngle / 2, -fanAngle / 2, t);
 
@@ -100,9 +147,11 @@ public class Player : MonoBehaviour
         }
     }
 
+    // Plain local mutation - called directly on whichever machine needs to
+    // apply the change (server applies it live, other clients apply it from
+    // inside a Mirror*ClientRpc handler below).
     public void RemoveCard(Card card)
     {
-        card.gameObject.SetActive(false);
         hand.Remove(card);
         DisplayHand();
     }
@@ -113,7 +162,36 @@ public class Player : MonoBehaviour
         DisplayHand();
         card.owner = this;
     }
-    
+
+    // --- Server-authoritative wrappers: mutate locally AND replicate ---
+
+    public void RemoveCardAndSync(Card card)
+    {
+        RemoveCard(card);
+        MirrorRemoveCardClientRpc(card.NetworkObject);
+    }
+
+    [ClientRpc]
+    private void MirrorRemoveCardClientRpc(NetworkObjectReference cardRef)
+    {
+        if (IsServer) return;
+        if (cardRef.TryGet(out NetworkObject obj)) RemoveCard(obj.GetComponent<Card>());
+    }
+
+    public void AddCardAndSync(Card card)
+    {
+        AddCard(card);
+        card.SetVisible(true);
+        MirrorAddCardClientRpc(card.NetworkObject);
+    }
+
+    [ClientRpc]
+    private void MirrorAddCardClientRpc(NetworkObjectReference cardRef)
+    {
+        if (IsServer) return;
+        if (cardRef.TryGet(out NetworkObject obj)) AddCard(obj.GetComponent<Card>());
+    }
+
     // NEW: drag hooks called by Card
     public void OnCardDragStart(Card card)
     {
@@ -144,10 +222,6 @@ public class Player : MonoBehaviour
             return;
         }
 
-        // Melding, discarding, and extending only make sense after this player
-        // has actually drawn this turn. Reject immediately with a clear reason
-        // rather than letting cards drift into staging and get stuck there
-        // until commit time, which is what was happening before this check.
         if (gameManager.currentPhase != GameManager.TurnPhase.Meld)
         {
             Debug.Log($"Can't do that yet - current phase is {gameManager.currentPhase}. Draw a card first.");
@@ -173,43 +247,70 @@ public class Player : MonoBehaviour
     {
         if (zone != null && zone.zoneType == DropZone.ZoneType.NewMeldStaging && zone.owner == this)
         {
-            // Dropped back onto its own staging zone - no change, just re-lay-out.
             DisplayStaging();
             return;
         }
 
-        // Any other drop target (including nowhere, or back into hand) cancels
-        // it out of staging and returns it to hand. This is also how a group
-        // stuck in staging after a rejected commit (see CommitStaging) gets
-        // unstuck - drag each card back out individually.
         stagingMeld.Remove(card);
         hand.Add(card);
         DisplayHand();
         DisplayStaging();
     }
 
-    private void TryExtendMeld(Meld meld, Card card)
-    {
-        bool success = gameManager.TryExtendMeld(this, meld, card);
-        if (!success)
-        {
-            DisplayHand(); // invalid extension, or illegal go-out - snap back
-        }
-        // On success, GameManager already called Player.ExtendMeld, which
-        // handles moving the card and refreshing the display.
-    }
+    // --- Discard: request goes to the server, result comes back via the
+    // shared RejectActionClientRpc (on failure) or the mirrored hand/pile
+    // updates (on success). ---
 
     private void TryDiscard(Card card)
     {
-        bool success = gameManager.DiscardCard(card);
-        if (!success)
-        {
-            // Illegal discard (e.g. would end the hand with no natural canasta) - snap back.
-            DisplayHand();
-        }
-        // On success the card has already left the hand and moved to the
-        // discard pile via GameManager/DiscardPile, so nothing more to do here.
+        RequestDiscardServerRpc(card.NetworkObject);
     }
+
+    [ServerRpc]
+    private void RequestDiscardServerRpc(NetworkObjectReference cardRef)
+    {
+        if (gameManager.ActivePlayer != this) { RejectActionClientRpc(); return; }
+        if (!cardRef.TryGet(out NetworkObject cardObj)) return;
+        Card card = cardObj.GetComponent<Card>();
+
+        bool success = gameManager.DiscardCard(card);
+        if (!success) RejectActionClientRpc();
+    }
+
+    // Generic "that didn't work, snap back to hand" notice. Safe to reuse
+    // for every action type below - only the requesting client's copy of
+    // this Player object actually reacts to it.
+    [ClientRpc]
+    private void RejectActionClientRpc()
+    {
+        if (!IsOwner) return;
+        DisplayHand();
+    }
+
+    // --- Draw ---
+
+    [ServerRpc]
+    public void RequestDrawFromDeckServerRpc()
+    {
+        if (gameManager.ActivePlayer != this) { RejectActionClientRpc(); return; }
+        gameManager.DrawFromDeck();
+    }
+
+    [ServerRpc]
+    public void RequestDrawFromDiscardServerRpc()
+    {
+        if (gameManager.ActivePlayer != this) { RejectActionClientRpc(); return; }
+        gameManager.DrawFromDiscardPile();
+    }
+
+    public void RequestTakeDiscardPile()
+    {
+        RequestDrawFromDiscardServerRpc();
+    }
+
+    // --- Staging a brand-new meld (all speculative and purely local until
+    // the group is complete - nothing here needs to be networked until
+    // CommitStaging actually asks the server to play it). ---
 
     private void TryAddToStaging(Card card)
     {
@@ -221,7 +322,7 @@ public class Player : MonoBehaviour
         if (!compatibleAsSet && !compatibleAsRun)
         {
             Debug.Log($"Staging: {card.rank} of {card.suit} rejected - doesn't fit as a set or run with the current staged group.");
-            DisplayHand(); // doesn't fit either shape at all - reject, snap back
+            DisplayHand();
             return;
         }
 
@@ -255,17 +356,42 @@ public class Player : MonoBehaviour
     private void CommitStaging(Meld.MeldType type)
     {
         List<Card> toCommit = new List<Card>(stagingMeld);
-        bool success = gameManager.TryPlayMeld(toCommit, type);
-        if (success)
-        {
-            Debug.Log("Meld committed successfully.");
-            stagingMeld.Clear();
-        }
-        else
-        {
-            Debug.Log("Meld commit REJECTED by GameManager.TryPlayMeld - check the log line just above " +
-                "this one for the specific reason. Cards remain staged; drag them back to hand individually to cancel.");
-        }
+        var refs = toCommit.Select(c => (NetworkObjectReference)c.NetworkObject).ToArray();
+        RequestPlayMeldServerRpc(refs, type);
+        // Don't clear stagingMeld yet - MirrorPlayMeldClientRpc clears it for
+        // us once the server confirms (see below). On rejection it just stays
+        // staged, same as the original synchronous behavior.
+    }
+
+    [ServerRpc]
+    private void RequestPlayMeldServerRpc(NetworkObjectReference[] cardRefs, Meld.MeldType type)
+    {
+        if (gameManager.ActivePlayer != this) { RejectActionClientRpc(); return; }
+
+        List<Card> cards = new List<Card>();
+        foreach (var r in cardRefs)
+            if (r.TryGet(out NetworkObject obj)) cards.Add(obj.GetComponent<Card>());
+
+        bool success = gameManager.TryPlayMeld(cards, type);
+        if (!success) RejectActionClientRpc();
+    }
+
+    public void PlayMeldAndSync(List<Card> cards, Meld.MeldType type)
+    {
+        PlayMeld(cards, type);
+        var refs = cards.Select(c => (NetworkObjectReference)c.NetworkObject).ToArray();
+        MirrorPlayMeldClientRpc(refs, type);
+    }
+
+    [ClientRpc]
+    private void MirrorPlayMeldClientRpc(NetworkObjectReference[] cardRefs, Meld.MeldType type)
+    {
+        if (IsServer) return;
+        var cards = new List<Card>();
+        foreach (var r in cardRefs)
+            if (r.TryGet(out NetworkObject obj)) cards.Add(obj.GetComponent<Card>());
+        PlayMeld(cards, type);
+        if (IsOwner) stagingMeld.Clear(); // this client's own staged group just got committed
     }
 
     private bool PartialSetCompatible(List<Card> cards)
@@ -278,9 +404,6 @@ public class Player : MonoBehaviour
     {
         var nonWild = cards.Where(c => !c.IsWild).ToList();
         if (nonWild.Count == 0) return true;
-        // Only rejects a clear suit mismatch early. Whether available wilds can
-        // actually bridge the eventual rank gaps is only verified once the
-        // staged group hits 3+ cards, via Meld.IsValidRun.
         return nonWild.Select(c => c.suit).Distinct().Count() <= 1;
     }
 
@@ -289,10 +412,45 @@ public class Player : MonoBehaviour
         for (int i = 0; i < stagingMeld.Count; i++)
         {
             stagingMeld[i].gameObject.SetActive(true);
-            stagingMeld[i].transform.position = stagingZoneAnchor.position
+            stagingMeld[i].transform.position = StagingZoneAnchor.position
                 + new Vector3(i * cardSpacingWithinMeld, 0, 0);
             stagingMeld[i].GetComponent<SpriteRenderer>().sortingOrder = i;
         }
+    }
+
+    // --- Extending an existing meld ---
+
+    private void TryExtendMeld(Meld meld, Card card)
+    {
+        int meldIndex = tableMelds.IndexOf(meld);
+        RequestExtendMeldServerRpc(meldIndex, card.NetworkObject);
+    }
+
+    [ServerRpc]
+    private void RequestExtendMeldServerRpc(int meldIndex, NetworkObjectReference cardRef)
+    {
+        if (gameManager.ActivePlayer != this) { RejectActionClientRpc(); return; }
+        if (meldIndex < 0 || meldIndex >= tableMelds.Count) { RejectActionClientRpc(); return; }
+        if (!cardRef.TryGet(out NetworkObject cardObj)) return;
+        Card card = cardObj.GetComponent<Card>();
+
+        bool success = gameManager.TryExtendMeld(this, tableMelds[meldIndex], card);
+        if (!success) RejectActionClientRpc();
+    }
+
+    public void ExtendMeldAndSync(Meld meld, Card card)
+    {
+        int meldIndex = tableMelds.IndexOf(meld);
+        ExtendMeld(meld, card);
+        MirrorExtendMeldClientRpc(meldIndex, card.NetworkObject);
+    }
+
+    [ClientRpc]
+    private void MirrorExtendMeldClientRpc(int meldIndex, NetworkObjectReference cardRef)
+    {
+        if (IsServer) return;
+        if (meldIndex < 0 || meldIndex >= tableMelds.Count) return;
+        if (cardRef.TryGet(out NetworkObject obj)) ExtendMeld(tableMelds[meldIndex], obj.GetComponent<Card>());
     }
 
     public void ExtendMeld(Meld meld, Card card)
@@ -303,19 +461,14 @@ public class Player : MonoBehaviour
         DisplayMelds();
     }
 
-    public void RequestTakeDiscardPile()
-    {
-        gameManager.DrawFromDiscardPile();
-    }
-
     public void BeginTurn()
     {
-        IsMyTurn = true;
+        if (IsServer) netIsMyTurn.Value = true;
     }
 
     public void EndTurn()
     {
-        IsMyTurn = false;
+        if (IsServer) netIsMyTurn.Value = false;
     }
 
     public void DealStartingHand()
@@ -335,13 +488,9 @@ public class Player : MonoBehaviour
 
     void DisplayMelds()
     {
-        // Rebuild every meld's drop-zone collider from scratch each call, since
-        // layout (and therefore where each meld's zone should sit) changes
-        // whenever a meld is added to or extended.
         foreach (var go in meldZoneObjects) Destroy(go);
         meldZoneObjects.Clear();
 
-        // Pack melds into rows so a wide set of trancas wraps instead of running off the table
         List<float> meldWidths = tableMelds.Select(m =>
             (m.cards.Count - 1) * cardSpacingWithinMeld).ToList();
 
@@ -383,16 +532,14 @@ public class Player : MonoBehaviour
                 for (int i = 0; i < meld.cards.Count; i++)
                 {
                     meld.cards[i].gameObject.SetActive(true);
-                    meld.cards[i].transform.position = meldContainer.position
+                    meld.cards[i].transform.position = MeldContainer.position
                         + new Vector3(cursorX + i * cardSpacingWithinMeld, y, 0);
                     meld.cards[i].GetComponent<SpriteRenderer>().sortingOrder = i;
                 }
 
-                // Drop-zone collider covering this meld, so a dragged card
-                // released here extends this specific meld.
                 GameObject zoneObj = new GameObject($"MeldZone_{tableMelds.IndexOf(meld)}");
-                zoneObj.transform.SetParent(meldContainer);
-                zoneObj.transform.position = meldContainer.position
+                zoneObj.transform.SetParent(MeldContainer);
+                zoneObj.transform.position = MeldContainer.position
                     + new Vector3(cursorX + meldWidth / 2f, y, 0);
                 BoxCollider2D col = zoneObj.AddComponent<BoxCollider2D>();
                 col.size = new Vector2(meldWidth + cardSpacingWithinMeld + 0.4f, 1.0f);
@@ -413,8 +560,21 @@ public class Player : MonoBehaviour
     {
         hand.Remove(card);
         playedRedThrees.Add(card);
-        card.gameObject.SetActive(true);
-        card.transform.position = redThreeContainer.position + new Vector3(playedRedThrees.Count * 0.6f, 0, 0);
+        card.transform.position = RedThreeContainer.position + new Vector3(playedRedThrees.Count * 0.6f, 0, 0);
+    }
+
+    public void PlayRedThreeAndSync(Card card)
+    {
+        PlayRedThree(card);
+        card.SetVisible(true);
+        MirrorPlayRedThreeClientRpc(card.NetworkObject);
+    }
+
+    [ClientRpc]
+    private void MirrorPlayRedThreeClientRpc(NetworkObjectReference cardRef)
+    {
+        if (IsServer) return;
+        if (cardRef.TryGet(out NetworkObject obj)) PlayRedThree(obj.GetComponent<Card>());
     }
 
     // --- Morto pickup ---
@@ -424,13 +584,16 @@ public class Player : MonoBehaviour
         morto = mortoCards;
     }
 
-    // Query without consuming - used to decide whether "going out" is currently legal.
     public bool HasMortoAvailable => !hasUsedMorto && morto.Count > 0;
 
-    public bool TryPickUpMorto()
+    // Returns the cards picked up (for GameManager to mirror to other
+    // clients), or null if there was nothing to pick up.
+    public List<Card> TryPickUpMorto()
     {
-        if (hasUsedMorto || morto.Count == 0) return false;
-        foreach (var c in morto)
+        if (hasUsedMorto || morto.Count == 0) return null;
+
+        List<Card> picked = new List<Card>(morto);
+        foreach (var c in picked)
         {
             c.owner = this;
             hand.Add(c);
@@ -438,17 +601,37 @@ public class Player : MonoBehaviour
         morto.Clear();
         hasUsedMorto = true;
         DisplayHand();
-        return true;
+        return picked;
     }
 
-    // Called when the shared deck runs dry and this player's unclaimed morto
-    // becomes the new deck instead. Returns null if there's nothing to release.
+    public void MortoPickupAndSync(List<Card> pickedUp)
+    {
+        var refs = pickedUp.Select(c => (NetworkObjectReference)c.NetworkObject).ToArray();
+        MirrorMortoPickupClientRpc(refs);
+    }
+
+    [ClientRpc]
+    private void MirrorMortoPickupClientRpc(NetworkObjectReference[] cardRefs)
+    {
+        if (IsServer) return;
+        foreach (var r in cardRefs)
+        {
+            if (r.TryGet(out NetworkObject obj))
+            {
+                Card c = obj.GetComponent<Card>();
+                c.owner = this;
+                hand.Add(c);
+            }
+        }
+        DisplayHand();
+    }
+
     public List<Card> ReleaseUnusedMorto()
     {
         if (hasUsedMorto || morto.Count == 0) return null;
         List<Card> released = new List<Card>(morto);
         morto.Clear();
-        hasUsedMorto = true; // no longer available for this player to pick up directly
+        hasUsedMorto = true;
         return released;
     }
 }

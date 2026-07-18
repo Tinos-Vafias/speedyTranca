@@ -6,6 +6,15 @@ EditorBuildSettings:
   serializedVersion: 2
   m_Scenes:
   - enabled: 1
+    path: Assets/Scenes/MainMenu.unity
+    guid: c98cb41ee58e1714fbd19576ef2b5494
+  - enabled: 1
+    path: Assets/Scenes/TrancaBoard.unity
+    guid: e8c32492af9ba714c9840e9fd8a5e691
+  - enabled: 1
+    path: Assets/Scenes/WinnerScene.unity
+    guid: a606d49c52b739c4a8ff719ca6b5de53
+  - enabled: 1
     path: Assets/Scenes/SampleScene.unity
     guid: 8c9cfa26abfee488c85f1582747f6a02
   m_configObjects:

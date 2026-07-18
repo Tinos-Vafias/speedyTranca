@@ -9,10 +9,11 @@ GameObject:
   serializedVersion: 6
   m_Component:
   - component: {fileID: 6192070906098147027}
-  - component: {fileID: 5696182515555279112}
   - component: {fileID: -4994476885002265590}
   - component: {fileID: 4844818196254440710}
   - component: {fileID: 1853756467965717153}
+  - component: {fileID: 5923275023765606911}
+  - component: {fileID: 3277076763877429134}
   m_Layer: 0
   m_Name: Card
   m_TagString: Untagged
@@ -40,22 +41,6 @@ RectTransform:
   m_AnchoredPosition: {x: 0.1617, y: 0.3659}
   m_SizeDelta: {x: 1, y: 1}
   m_Pivot: {x: 0.5, y: 0.5}
---- !u!114 &5696182515555279112
-MonoBehaviour:
-  m_ObjectHideFlags: 0
-  m_CorrespondingSourceObject: {fileID: 0}
-  m_PrefabInstance: {fileID: 0}
-  m_PrefabAsset: {fileID: 0}
-  m_GameObject: {fileID: 5130389114703558053}
-  m_Enabled: 1
-  m_EditorHideFlags: 0
-  m_Script: {fileID: 11500000, guid: 31b68daf867b5154dba74dea92128817, type: 3}
-  m_Name: 
-  m_EditorClassIdentifier: 
-  cardLabel: {fileID: 9044091143722773746}
-  suit: 0
-  rank: 2
-  owner: {fileID: 0}
 --- !u!212 &-4994476885002265590
 SpriteRenderer:
   m_ObjectHideFlags: 0
@@ -165,6 +150,49 @@ BoxCollider2D:
   m_AutoTiling: 0
   m_Size: {x: 1, y: 1}
   m_EdgeRadius: 0
+--- !u!114 &5923275023765606911
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 5130389114703558053}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: d5a57f767e5e46a458fc5d3c628d0cbb, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+  GlobalObjectIdHash: 1218208073
+  InScenePlacedSourceGlobalObjectIdHash: 0
+  DeferredDespawnTick: 0
+  Ownership: 1
+  AlwaysReplicateAsRoot: 0
+  SynchronizeTransform: 1
+  <InScenePlaced>k__BackingField: 0
+  ActiveSceneSynchronization: 0
+  SceneMigrationSynchronization: 1
+  SpawnWithObservers: 1
+  DontDestroyWithOwner: 0
+  AutoObjectParentSync: 1
+  SyncOwnerTransformWhenParented: 1
+  AllowOwnerToParent: 0
+--- !u!114 &3277076763877429134
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 5130389114703558053}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 31b68daf867b5154dba74dea92128817, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+  ShowTopMostFoldoutHeaderGroup: 1
+  cardLabel: {fileID: 9044091143722773746}
+  suit: 0
+  rank: 0
+  owner: {fileID: 0}
 --- !u!1 &5574151778544264841
 GameObject:
   m_ObjectHideFlags: 0

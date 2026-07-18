@@ -2,20 +2,19 @@ using UnityEngine;
 using UnityEngine.SceneManagement;
 using UnityEngine.UI;
 using TMPro;
+using Unity.Netcode;
 
 // Attach to an empty GameObject in the dedicated winner/victory scene.
-// GameManager loads this scene when the game ends; this script just reads
-// the static GameResult that GameManager filled in right before the load,
-// displays it, and sends the player back to the main scene on button press.
-public class WinnerSceneController : MonoBehaviour
+// GameManager loads this scene (via NetworkManager.SceneManager, so it loads
+// on both machines together) and announces the result via ClientRpc just
+// before doing so - see GameManager.GoToWinnerScene / AnnounceResultClientRpc.
+public class WinnerSceneController : NetworkBehaviour
 {
     [Header("UI")]
     public TMP_Text messageText;
     public Button playAgainButton;
 
     [Header("Scene To Return To")]
-    // Must exactly match the main scene's file name and be added in
-    // File -> Build Settings -> Scenes In Build.
     public string mainSceneName = "MainScene";
 
     void Awake()
@@ -28,14 +27,18 @@ public class WinnerSceneController : MonoBehaviour
     {
         if (messageText != null)
             messageText.text = BuildMessage();
+
+        // Only the host actually owns scene transitions - a non-host client
+        // pressing "Play Again" shouldn't be able to yank both machines back
+        // to the main scene on their own.
+        if (playAgainButton != null && NetworkManager.Singleton != null)
+            playAgainButton.interactable = NetworkManager.Singleton.IsServer;
     }
 
     private string BuildMessage()
     {
         if (!GameResult.HasResult)
         {
-            // Defensive fallback - shouldn't happen if this scene is only
-            // ever reached via GameManager's end-of-game transition.
             return "Game Over";
         }
 
@@ -48,7 +51,9 @@ public class WinnerSceneController : MonoBehaviour
 
     private void ReturnToMainScene()
     {
+        if (NetworkManager.Singleton == null || !NetworkManager.Singleton.IsServer) return;
+
         GameResult.Clear();
-        SceneManager.LoadScene(mainSceneName);
+        NetworkManager.Singleton.SceneManager.LoadScene(mainSceneName, LoadSceneMode.Single);
     }
 }

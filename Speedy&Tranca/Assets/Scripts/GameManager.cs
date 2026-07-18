@@ -2,71 +2,77 @@ using UnityEngine;
 using UnityEngine.SceneManagement;
 using System.Collections.Generic;
 using System.Linq;
+using Unity.Netcode;
 
-public class GameManager : MonoBehaviour
+public class GameManager : NetworkBehaviour
 {
     public enum GameState
     {
         Setup,
-        PlayerOneTurn, 
+        PlayerOneTurn,
         PlayerTwoTurn,
         GameOver,
     }
 
     public enum TurnPhase
     {
-        Draw,    // must draw from deck, or take the (unlocked) discard pile
-        Meld,    // optional: lay down / extend melds
-        Discard, // reserved for future use if you split "must discard" into its own explicit phase
+        Draw,
+        Meld,
+        Discard,
     }
 
-    [Header("Core References")] 
+    [Header("Core References")]
     public Deck deck;
     public Player playerOne;
     public Player playerTwo;
     public DiscardPile discardPile;
-    
+
     [Header("Game State")]
-    public GameState currentState = GameState.Setup;
-    public TurnPhase currentPhase = TurnPhase.Draw;
+    // These used to be plain fields. They're now backed by NetworkVariables
+    // so every connected client - not just the host - sees the true current
+    // state (UIManager and Player's phase check both just read these).
+    private NetworkVariable<GameState> netCurrentState = new NetworkVariable<GameState>(GameState.Setup);
+    private NetworkVariable<TurnPhase> netCurrentPhase = new NetworkVariable<TurnPhase>(TurnPhase.Draw);
+    public GameState currentState => netCurrentState.Value;
+    public TurnPhase currentPhase => netCurrentPhase.Value;
 
     [Header("Scene Transition")]
-    // Must exactly match the winner scene's file name and be added in
-    // File -> Build Settings -> Scenes In Build.
     public string winnerSceneName = "WinnerScene";
 
     private Player activePlayer;
     private Player waitingPlayer;
+    public Player ActivePlayer => activePlayer;
 
-    // Set when a player empties their hand via discard (indirect knockout):
-    // they still get their morto, but by the rules can't act on it until their NEXT turn.
-    // Not yet enforced against input - see note in StartTurn().
-    private bool pendingIndirectMortoDelay;
-
-    // Set true when a player's turn had nothing left to draw (deck and all
-    // mortos exhausted). If this happens on two consecutive turns - i.e. neither
-    // player could draw - the round ends. Reset to false on any successful draw.
-    private bool previousTurnFailedToDraw;
-
-    // --- Victory tracking ---
-    // Set at the same moment the game ends, immediately before handing off
-    // to the winner scene via GameResult (see GoToWinnerScene). Exposed here
-    // too in case anything still active this same frame wants it.
-    public Player WinningPlayer { get; private set; }
-
-    void Start()
+    // Whichever Player object the LOCAL client owns - null until
+    // NetworkGameSetup has assigned ownership (or if this machine is
+    // spectating, which isn't wired up in this project).
+    public Player LocalPlayer
     {
-        SetupGame();
+        get
+        {
+            if (playerOne != null && playerOne.IsOwner) return playerOne;
+            if (playerTwo != null && playerTwo.IsOwner) return playerTwo;
+            return null;
+        }
     }
 
-    void Update()
+    private bool pendingIndirectMortoDelay;
+    private bool previousTurnFailedToDraw;
+
+    public Player WinningPlayer { get; private set; }
+
+    // SetupGame used to run from Start(). It now waits for
+    // NetworkGameSetup.BeginGame() to fire once both players are connected
+    // and assigned, so the round doesn't start before Player Two has joined.
+    public void BeginGame()
     {
-        
+        if (!IsServer) return;
+        SetupGame();
     }
 
     private void SetupGame()
     {
-        currentState = GameState.Setup;
+        netCurrentState.Value = GameState.Setup;
         WinningPlayer = null;
 
         playerOne.DealStartingHand();
@@ -80,28 +86,29 @@ public class GameManager : MonoBehaviour
 
     private void StartTurn(GameState nextState)
     {
-        currentState = nextState;
-        currentPhase = TurnPhase.Draw;
+        if (!IsServer) return;
 
-        activePlayer = (currentState == GameState.PlayerOneTurn) ? playerOne : playerTwo;
-        waitingPlayer = (currentState == GameState.PlayerOneTurn) ? playerTwo : playerOne;
+        netCurrentState.Value = nextState;
+        netCurrentPhase.Value = TurnPhase.Draw;
+
+        activePlayer = (nextState == GameState.PlayerOneTurn) ? playerOne : playerTwo;
+        waitingPlayer = (nextState == GameState.PlayerOneTurn) ? playerTwo : playerOne;
 
         activePlayer.BeginTurn();
         waitingPlayer.EndTurn();
 
-        // TODO: if pendingIndirectMortoDelay applies to activePlayer, this is where
-        // you'd clear it now that their next turn has arrived (currently unused
-        // beyond being set - hook it up once morto-use timing needs enforcing).
-
-        Debug.Log($"{currentState} started!");
+        Debug.Log($"{nextState} started!");
     }
 
     // ------------------------------------------------------------------
-    // Draw phase
+    // Draw phase - called only from Player's RequestDrawFromDeckServerRpc /
+    // RequestDrawFromDiscardServerRpc, both of which already verified the
+    // caller is the active player before getting here.
     // ------------------------------------------------------------------
 
     public void DrawFromDeck()
     {
+        if (!IsServer) return;
         if (currentPhase != TurnPhase.Draw) return;
 
         Card drawn = deck.Deal();
@@ -115,28 +122,20 @@ public class GameManager : MonoBehaviour
         {
             if (previousTurnFailedToDraw)
             {
-                // Neither player could draw on consecutive turns - the stock
-                // is truly dead. The round ends right here. Nobody went out,
-                // so the winner (if any) is decided by score.
                 EndGameByScore();
                 return;
             }
 
-            // This player can't draw, but it's the first time in a row this has
-            // happened - skip the draw and let them meld/discard from their
-            // existing hand instead. Their turn still ends normally via discard.
             previousTurnFailedToDraw = true;
-            currentPhase = TurnPhase.Meld;
+            netCurrentPhase.Value = TurnPhase.Meld;
             Debug.Log("Nothing left to draw - skipping to meld/discard.");
             return;
         }
 
-        previousTurnFailedToDraw = false; // a successful draw resets the streak
+        previousTurnFailedToDraw = false;
         HandleDrawnCard(drawn);
     }
 
-    // When the deck runs dry, whichever morto hasn't been claimed yet becomes
-    // the new deck. Tries playerOne's first, then playerTwo's.
     private bool TryRefillDeckFromMorto()
     {
         List<Card> released = playerOne.ReleaseUnusedMorto() ?? playerTwo.ReleaseUnusedMorto();
@@ -149,38 +148,38 @@ public class GameManager : MonoBehaviour
 
     public void DrawFromDiscardPile()
     {
+        if (!IsServer) return;
         if (currentPhase != TurnPhase.Draw) return;
-        if (discardPile.IsLocked) return; // a discarded black three locks the pile
+        if (discardPile.IsLocked) return;
 
-        // House rule: taking the pile is free - no requirement to immediately
-        // meld the top card. The whole pile goes straight into the hand.
-        List<Card> taken = discardPile.TakeAll();
+        List<Card> taken = discardPile.TakeAllAndSync();
         foreach (Card c in taken)
-            activePlayer.AddCard(c);
+            activePlayer.AddCardAndSync(c);
 
-        previousTurnFailedToDraw = false; // they found cards somewhere, streak broken
-        currentPhase = TurnPhase.Meld;
+        previousTurnFailedToDraw = false;
+        netCurrentPhase.Value = TurnPhase.Meld;
     }
 
     private void HandleDrawnCard(Card drawn)
     {
         if (drawn.IsRedThree)
         {
-            activePlayer.PlayRedThree(drawn);
-            DrawFromDeck(); // red three is never kept - draw again to replace it
+            activePlayer.PlayRedThreeAndSync(drawn);
+            DrawFromDeck();
             return;
         }
 
-        activePlayer.AddCard(drawn);
-        currentPhase = TurnPhase.Meld;
+        activePlayer.AddCardAndSync(drawn);
+        netCurrentPhase.Value = TurnPhase.Meld;
     }
 
     // ------------------------------------------------------------------
-    // Meld phase
+    // Meld phase - called only from Player's Request*ServerRpc methods.
     // ------------------------------------------------------------------
 
     public bool TryPlayMeld(List<Card> cards, Meld.MeldType type)
     {
+        if (!IsServer) return false;
         if (currentPhase != TurnPhase.Meld)
         {
             Debug.Log($"TryPlayMeld REJECTED: currentPhase is {currentPhase}, not Meld.");
@@ -198,8 +197,6 @@ public class GameManager : MonoBehaviour
             return false;
         }
 
-        // Would this meld empty the player's hand? (Assumes `cards` are all drawn
-        // from hand, i.e. this is forming a brand-new meld, not extending one.)
         bool wouldEmptyHand = !activePlayer.Hand.Except(cards).Any();
         Debug.Log($"TryPlayMeld check: activePlayer has {activePlayer.Hand.Count} card(s) in hand, wouldEmptyHand={wouldEmptyHand}");
 
@@ -209,15 +206,11 @@ public class GameManager : MonoBehaviour
             return false;
         }
 
-        activePlayer.PlayMeld(cards, type);
+        activePlayer.PlayMeldAndSync(cards, type);
         CheckHandEmptied(emptiedByDiscard: false);
         return true;
     }
 
-    // A player may only end with an empty hand if they still have a morto to draw
-    // into (so the round continues), or already have a natural canasta on the table
-    // - counting the meld about to be played, since that meld could itself be the
-    // natural canasta that legalizes going out.
     private bool WouldBeLegalGoOut(Player p, List<Card> cardsAboutToMeld)
     {
         if (p.HasMortoAvailable) return true;
@@ -230,6 +223,7 @@ public class GameManager : MonoBehaviour
 
     public bool TryExtendMeld(Player player, Meld meld, Card card)
     {
+        if (!IsServer) return false;
         if (currentPhase != TurnPhase.Meld) return false;
         if (player != activePlayer) return false;
         if (!player.TableMelds.Contains(meld)) return false;
@@ -247,85 +241,70 @@ public class GameManager : MonoBehaviour
             return false;
         }
 
-        player.ExtendMeld(meld, card);
+        player.ExtendMeldAndSync(meld, card);
         CheckHandEmptied(emptiedByDiscard: false);
         return true;
     }
 
     // ------------------------------------------------------------------
-    // Discard - ends the turn
+    // Discard - ends the turn. Called only from Player's RequestDiscardServerRpc.
     // ------------------------------------------------------------------
 
     public bool DiscardCard(Card card)
     {
-        // Must have drawn (and optionally melded) before discarding.
+        if (!IsServer) return false;
         if (currentPhase != TurnPhase.Meld) return false;
 
         bool wouldEmptyHand = activePlayer.Hand.Count == 1 && activePlayer.Hand.Contains(card);
 
         if (wouldEmptyHand && !WouldBeLegalGoOut(activePlayer, cardsAboutToMeld: new List<Card>()))
         {
-            // Illegal: discarding this card would end their hand with no morto
-            // left and no natural canasta on the table. Reject - they must hold
-            // the card (or meld first) instead.
             return false;
         }
 
-        activePlayer.RemoveCard(card);
-        discardPile.Discard(card);
+        activePlayer.RemoveCardAndSync(card);
+        discardPile.DiscardAndSync(card);
 
         bool wentOut = CheckHandEmptied(emptiedByDiscard: true);
         if (!wentOut)
         {
             EndCurrentTurn();
         }
-        // If wentOut is true and the player had no morto left, CheckHandEmptied
-        // already confirmed a natural canasta exists (guaranteed by the check
-        // above) and set GameState.GameOver, so the turn simply doesn't advance.
         return true;
     }
 
-    // Returns true if the active player's hand was empty after the triggering action.
     private bool CheckHandEmptied(bool emptiedByDiscard)
     {
         if (activePlayer.Hand.Count > 0) return false;
 
-        if (activePlayer.TryPickUpMorto())
+        List<Card> pickedUp = activePlayer.TryPickUpMorto();
+        if (pickedUp != null)
         {
+            activePlayer.MortoPickupAndSync(pickedUp);
+
             if (emptiedByDiscard)
             {
-                // Indirect knockout: they get the morto, but by the rules can't use
-                // it until their next turn. Turn still ends normally from here.
                 pendingIndirectMortoDelay = true;
             }
             else
             {
-                // Direct knockout: melded their last card, so they keep playing
-                // this same turn with the morto cards now in hand.
-                currentPhase = TurnPhase.Meld;
+                netCurrentPhase.Value = TurnPhase.Meld;
             }
         }
         else
         {
-            // No morto left to take - this player has actually gone out.
-            // TryPlayMeld/DiscardCard already guarantee a natural canasta exists
-            // before letting this state occur, so this is a safety net, not the
-            // primary enforcement point.
             string winnerName = (activePlayer == playerOne) ? "Player 1" : "Player 2";
             int winnerScore = TrancaScoring.ScorePlayer(activePlayer);
             int otherScore = TrancaScoring.ScorePlayer(activePlayer == playerOne ? playerTwo : playerOne);
 
             Debug.Log($"Game over - {winnerName} went out.");
             GoToWinnerScene(isTie: false, winnerName, winnerScore, otherScore, winner: activePlayer);
-            return true; // GameManager (and this scene) is being torn down - nothing more to do
+            return true;
         }
 
         return true;
     }
 
-    // Stock-exhaustion ending: nobody went out, so the winner is whoever has
-    // the higher TrancaScoring total at the moment the stock died. An exact
-    // tie is possible and is reported as such rather than picking one.
     private void EndGameByScore()
     {
         int p1Score = TrancaScoring.ScorePlayer(playerOne);
@@ -347,23 +326,33 @@ public class GameManager : MonoBehaviour
         GoToWinnerScene(isTie: false, winnerName, winnerScore, otherScore, winner);
     }
 
-    // Single exit point for ending the game: records the outcome in the
-    // GameResult static (which survives the scene load) and hands off to the
-    // dedicated winner scene. Set currentState first purely for anything that
-    // might poll it in this same frame before the load takes effect; after
-    // SceneManager.LoadScene runs, don't touch any other object on this
-    // GameManager or its scene again - it's on its way out.
+    // Every machine needs to end up with the same GameResult static data
+    // before the scene actually switches, since GameResult itself is just a
+    // local, per-process cache - see AnnounceResultClientRpc.
     private void GoToWinnerScene(bool isTie, string winnerName, int winnerScore, int otherScore, Player winner)
     {
-        currentState = GameState.GameOver;
+        if (!IsServer) return;
+
+        netCurrentState.Value = GameState.GameOver;
         WinningPlayer = winner;
 
-        if (isTie)
-            GameResult.SetTie(winnerScore);
-        else
-            GameResult.SetWinner(winnerName, winnerScore, otherScore);
+        AnnounceResultClientRpc(isTie, winnerName ?? "", winnerScore, otherScore);
 
-        SceneManager.LoadScene(winnerSceneName);
+        if (isTie) GameResult.SetTie(winnerScore);
+        else GameResult.SetWinner(winnerName, winnerScore, otherScore);
+
+        // NGO's own scene manager, not SceneManager.LoadScene directly - this
+        // is what makes both machines load the winner scene together.
+        // Requires "Enable Scene Management" on the NetworkManager.
+        NetworkManager.Singleton.SceneManager.LoadScene(winnerSceneName, LoadSceneMode.Single);
+    }
+
+    [ClientRpc]
+    private void AnnounceResultClientRpc(bool isTie, string winnerName, int winnerScore, int otherScore)
+    {
+        if (IsServer) return; // host already set this directly above
+        if (isTie) GameResult.SetTie(winnerScore);
+        else GameResult.SetWinner(winnerName, winnerScore, otherScore);
     }
 
     private bool HasNaturalCanasta(Player p)
@@ -373,6 +362,7 @@ public class GameManager : MonoBehaviour
 
     public void EndCurrentTurn()
     {
+        if (!IsServer) return;
         if (currentState == GameState.GameOver) return;
 
         activePlayer.EndTurn();
@@ -385,18 +375,16 @@ public class GameManager : MonoBehaviour
     }
 
     // ------------------------------------------------------------------
-    // Debug hooks (Editor only) - jump straight to an end-game condition
-    // without having to actually play out a hand. Right-click the
-    // GameManager component in the Inspector (while in Play Mode) to fire
-    // these from the context menu.
+    // Debug hooks (Editor only) - now server-only, since game state can
+    // only legally be mutated on the server.
     // ------------------------------------------------------------------
 #if UNITY_EDITOR
     [ContextMenu("DEBUG: Force Active Player To Go Out")]
     private void DebugForceActivePlayerGoOut()
     {
-        if (!Application.isPlaying)
+        if (!Application.isPlaying || !IsServer)
         {
-            Debug.LogWarning("DebugForceActivePlayerGoOut only works in Play Mode.");
+            Debug.LogWarning("DebugForceActivePlayerGoOut only works in Play Mode, on the server/host.");
             return;
         }
 
@@ -406,10 +394,6 @@ public class GameManager : MonoBehaviour
             return;
         }
 
-        // WouldBeLegalGoOut requires either an available morto or a natural
-        // canasta already on the table. Fake a natural canasta directly onto
-        // the active player's table state so the normal legality check passes
-        // without needing 7 real matching cards drawn and melded.
         if (!HasNaturalCanasta(activePlayer))
         {
             List<Card> fakeCanasta = activePlayer.Hand.Take(7).ToList();
@@ -420,13 +404,11 @@ public class GameManager : MonoBehaviour
                     "canasta this way. Draw a few more cards first, or just clear morto manually.");
                 return;
             }
-            activePlayer.PlayMeld(fakeCanasta, Meld.MeldType.Set);
+            activePlayer.PlayMeldAndSync(fakeCanasta, Meld.MeldType.Set);
         }
 
-        // Empty whatever's left in hand - RemoveCard mutates the list we're
-        // iterating, so drain by always taking index 0 rather than foreach.
         while (activePlayer.Hand.Count > 0)
-            activePlayer.RemoveCard(activePlayer.Hand[0]);
+            activePlayer.RemoveCardAndSync(activePlayer.Hand[0]);
 
         Debug.Log($"DEBUG: forced {(activePlayer == playerOne ? "Player 1" : "Player 2")} to go out.");
         CheckHandEmptied(emptiedByDiscard: false);
@@ -435,9 +417,9 @@ public class GameManager : MonoBehaviour
     [ContextMenu("DEBUG: Force Stock Exhaustion (score-based ending)")]
     private void DebugForceStockExhaustion()
     {
-        if (!Application.isPlaying)
+        if (!Application.isPlaying || !IsServer)
         {
-            Debug.LogWarning("DebugForceStockExhaustion only works in Play Mode.");
+            Debug.LogWarning("DebugForceStockExhaustion only works in Play Mode, on the server/host.");
             return;
         }
 
@@ -449,21 +431,15 @@ public class GameManager : MonoBehaviour
 
         if (currentPhase != TurnPhase.Draw)
         {
-            Debug.LogWarning($"DebugForceStockExhaustion: currentPhase is {currentPhase}, not Draw. " +
-                "This hook drains the deck and calls DrawFromDeck(), which no-ops outside the Draw phase.");
+            Debug.LogWarning($"DebugForceStockExhaustion: currentPhase is {currentPhase}, not Draw.");
             return;
         }
 
         while (deck.Deal() != null) { /* drain it */ }
 
-        // Also strip both mortos so TryRefillDeckFromMorto() can't quietly
-        // refill the deck we just drained.
         activePlayer.ReleaseUnusedMorto();
         waitingPlayer.ReleaseUnusedMorto();
 
-        // First call hits the "nothing to draw, skip to meld" branch and sets
-        // previousTurnFailedToDraw; simulate the flag being already set so
-        // this single call goes straight to the score-based ending.
         previousTurnFailedToDraw = true;
         Debug.Log("DEBUG: forcing stock exhaustion - calling DrawFromDeck() now.");
         DrawFromDeck();
